@@ -1,0 +1,339 @@
+// NodePay Prisma schema
+// Non-custodial payment gateway: merchants bring their own wallet addresses.
+// The platform stores NO private keys — only xpubs (for HD address derivation),
+// public addresses, and encrypted webhook/TOTP secrets.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  MERCHANT
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum Plan {
+  FREE
+  PRO
+}
+
+enum Network {
+  BTC
+  LTC
+  ETH
+  BSC
+  TRON
+}
+
+enum Coin {
+  BTC
+  LTC
+  ETH
+  BNB
+  TRX
+  USDT
+  USDC
+}
+
+enum InvoiceStatus {
+  WAITING
+  DETECTED
+  CONFIRMING
+  PAID
+  EXPIRED
+  UNDERPAID
+  OVERPAID
+  CANCELED
+}
+
+enum AddressMode {
+  HD // unique address derived from merchant xpub (BTC / EVM / TRON)
+  STATIC // single merchant address, matched by destination address
+  AMOUNT_OFFSET // unique decimal offset per invoice, matched by exact amount + time window
+}
+
+enum PaymentStatus {
+  DETECTED
+  CONFIRMING
+  CONFIRMED
+}
+
+enum WebhookStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+enum AccrualStatus {
+  ACCRUED
+  BILLED
+  PAID
+}
+
+enum InvoiceType {
+  LINK
+  INVOICE
+  API
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  name         String?
+  role         Role       @default(MERCHANT)
+  status       UserStatus @default(ACTIVE)
+  plan         Plan       @default(FREE)
+  // platform fee accrued per confirmed invoice (basis points, 100 = 1%)
+  feeBps       Int        @default(100)
+  totpSecret   String? // encrypted at rest
+  totpEnabled  Boolean    @default(false)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  wallets         Wallet[]
+  apiKeys         ApiKey[]
+  invoices        Invoice[]
+  payments        Payment[]
+  webhookEndpoints WebhookEndpoint[]
+  deliveries      WebhookDelivery[]
+  refreshTokens   RefreshToken[]
+  feeAccruals     FeeAccrual[]
+  auditLogs       AuditLog[]
+
+  @@index([status, createdAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Merchant configuration
+// ---------------------------------------------------------------------------
+
+model Wallet {
+  id             String   @id @default(cuid())
+  userId         String
+  network        Network
+  // Plain receive address (fallback / used when no xpub given)
+  address        String?
+  // Extended public key — enables unique per-invoice address derivation.
+  // Private keys are NEVER accepted or stored.
+  xpub           String?
+  // Base derivation path for HD wallets, e.g. m/84'/0'/0'
+  derivationPath String?
+  label          String?
+  isDefault      Boolean  @default(false)
+  nextIndex      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, network, address])
+  @@index([userId, network])
+}
+
+model ApiKey {
+  id           String    @id @default(cuid())
+  userId       String
+  name         String
+  publicKey    String    @unique
+  secretHash   String
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  createdAt    DateTime   @default(now())
+
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invoices  Invoice[]
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Invoices & payments
+// ---------------------------------------------------------------------------
+
+model Invoice {
+  id          String        @id @default(cuid())
+  // public id used in checkout URLs: /pay/<publicId>
+  publicId    String        @unique
+  userId      String
+  apiKeyId    String?
+  type        InvoiceType   @default(INVOICE)
+  orderId     String?
+  description String?
+
+  amountFiat    Decimal @db.Decimal(18, 2)
+  fiatCurrency  String  @default("USD")
+  coin          Coin
+  network       Network
+  lockedRate    Decimal @db.Decimal(24, 12) // fiat per 1 unit of coin, locked for invoice lifetime
+  cryptoAmount  Decimal @db.Decimal(24, 12) // exact amount the customer must send
+
+  addressMode     AddressMode
+  address         String // destination address (derived HD address or merchant static address)
+  derivationIndex Int?
+  amountOffset    Decimal? @db.Decimal(24, 12) // unique decimal offset for AMOUNT_OFFSET mode
+  walletId        String?
+
+  status            InvoiceStatus @default(WAITING)
+  confirmations     Int           @default(0)
+  requiredConfirm   Int           @default(0)
+  netCryptoReceived Decimal?      @db.Decimal(24, 12)
+  txHash            String?
+
+  successUrl  String?
+  cancelUrl   String?
+  expiresAt   DateTime
+  paidAt      DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKey   ApiKey?  @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  payments Payment[]
+  accrual  FeeAccrual?
+
+  @@index([userId, status, createdAt])
+  @@index([userId, coin])
+  @@index([network, status, expiresAt])
+  @@index([network, address])
+  @@index([network, cryptoAmount, status])
+}
+
+model Payment {
+  id        String        @id @default(cuid())
+  invoiceId String
+  userId    String
+  network   Network
+  txHash    String
+  // raw inputs, set on first detection
+  amount    Decimal       @db.Decimal(24, 12)
+  fromAddress String?
+  blockNumber Int?
+  confirmations Int       @default(0)
+  status    PaymentStatus @default(DETECTED)
+  detectedAt DateTime     @default(now())
+  confirmedAt DateTime?
+  // guards against double-crediting the same transaction
+  credited  Boolean       @default(false)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([network, txHash])
+  @@index([invoiceId])
+  @@index([userId, detectedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+model WebhookEndpoint {
+  id        String   @id @default(cuid())
+  userId    String
+  url       String
+  secretEnc String // AES-256-GCM encrypted at rest
+  events    String[] // e.g. ["invoice.confirmed", "invoice.detected"]
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries  WebhookDelivery[]
+
+  @@index([userId])
+}
+
+model WebhookDelivery {
+  id           String         @id @default(cuid())
+  endpointId   String
+  userId       String
+  eventId      String // unique per (endpoint, event) — replay protection
+  event        String
+  payload      Json
+  status       WebhookStatus  @default(PENDING)
+  attempts     Int            @default(0)
+  responseCode Int?
+  response     String?
+  error        String?
+  nextAttemptAt DateTime?
+  deliveredAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([endpointId, eventId])
+  @@index([userId, createdAt])
+  @@index([status, nextAttemptAt])
+}
+
+// ---------------------------------------------------------------------------
+// Platform fees (non-custodial accrual: merchants settle via fee invoices)
+// ---------------------------------------------------------------------------
+
+model FeeAccrual {
+  id        String        @id @default(cuid())
+  userId    String
+  invoiceId String        @unique
+  fiatValue Decimal       @db.Decimal(18, 2)
+  fiatCurrency String     @default("USD")
+  feeBps    Int
+  feeFiat   Decimal       @db.Decimal(18, 2)
+  status    AccrualStatus @default(ACCRUED)
+  settledAt DateTime?
+  createdAt DateTime      @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  target    String?
+  meta      Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}

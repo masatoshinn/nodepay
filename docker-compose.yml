@@ -1,0 +1,68 @@
+services:
+  # Local Postgres — optional. Only starts with: --profile localdb
+  # (e.g. when NOT using Supabase). API/worker read DATABASE_URL from server/.env.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["localdb"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nodepay
+      POSTGRES_PASSWORD: nodepay
+      POSTGRES_DB: nodepay
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodepay -d nodepay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./server
+    restart: unless-stopped
+    env_file: ./server/.env
+    environment:
+      # DATABASE_URL comes from server/.env (Supabase or local)
+      REDIS_URL: redis://redis:6379
+      APP_URL: ${APP_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    ports:
+      - "4000:4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./server
+    restart: unless-stopped
+    env_file: ./server/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+    command: node dist/workers/main.js
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    build: ./client
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
